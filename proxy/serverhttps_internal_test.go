@@ -24,6 +24,38 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func TestProxy_healthCheck(t *testing.T) {
+	tlsConf, caPem := newTLSConfig(t)
+	dnsProxy := mustNew(t, &Config{
+		Logger:                 slogutil.NewDiscardLogger(),
+		TLSListenAddr:          []*net.TCPAddr{net.TCPAddrFromAddrPort(localhostAnyPort)},
+		HTTPSListenAddr:        []*net.TCPAddr{net.TCPAddrFromAddrPort(localhostAnyPort)},
+		QUICListenAddr:         []*net.UDPAddr{net.UDPAddrFromAddrPort(localhostAnyPort)},
+		TLSConfig:              tlsConf,
+		UpstreamConfig:         newTestUpstreamConfig(t, defaultTimeout, testDefaultUpstreamAddr),
+		TrustedProxies:         defaultTrustedProxies,
+		RatelimitSubnetLenIPv4: 24,
+		RatelimitSubnetLenIPv6: 64,
+	})
+
+	servicetest.RequireRun(t, dnsProxy, testTimeout)
+
+	client := createTestHTTPClient(dnsProxy, caPem, false)
+	req, err := http.NewRequest(http.MethodGet, "https://"+tlsServerName+healthCheckPath, nil)
+	require.NoError(t, err)
+
+	resp, err := client.Do(req)
+	require.NoError(t, err)
+	testutil.CleanupAndRequireSuccess(t, resp.Body.Close)
+
+	body, err := io.ReadAll(resp.Body)
+	require.NoError(t, err)
+
+	assert.Equal(t, http.StatusOK, resp.StatusCode)
+	assert.Equal(t, "OK", string(body))
+	assert.Equal(t, "text/plain; charset=utf-8", resp.Header.Get("Content-Type"))
+}
+
 func TestHttpsProxy(t *testing.T) {
 	testCases := []struct {
 		name  string
