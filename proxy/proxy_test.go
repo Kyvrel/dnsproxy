@@ -3,17 +3,25 @@ package proxy_test
 import (
 	"net"
 	"testing"
+	"time"
 
 	"github.com/AdguardTeam/dnsproxy/internal/bootstrap"
 	"github.com/AdguardTeam/dnsproxy/internal/dnsproxytest"
 	"github.com/AdguardTeam/dnsproxy/proxy"
 	"github.com/AdguardTeam/dnsproxy/upstream"
+	"github.com/AdguardTeam/golibs/logutil/slogutil"
 	"github.com/AdguardTeam/golibs/testutil"
 	"github.com/AdguardTeam/golibs/testutil/servicetest"
 	"github.com/miekg/dns"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+// defaultTimeout is a default timeout for tests.
+const defaultTimeout = 10 * time.Second
+
+// testLogger is a common logger for tests.
+var testLogger = slogutil.NewDiscardLogger()
 
 // newCustomUpstreamConfig is a helper function that returns an initialized
 // [*proxy.CustomUpstreamConfig].
@@ -42,7 +50,7 @@ func isCachedWithCustomConfig(
 		Req:                  (&dns.Msg{}).SetQuestion(fqdn, dns.TypeA),
 	}
 
-	err := p.Resolve(d)
+	err := p.Resolve(testutil.ContextWithTimeout(tb, defaultTimeout), d)
 	require.NoError(tb, err)
 
 	qs := d.QueryStatistics()

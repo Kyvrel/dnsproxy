@@ -77,29 +77,40 @@ func (p *Proxy) listenH3(
 
 // initHTTPSListeners creates TCP/UDP listeners and HTTP/H3 servers.
 func (p *Proxy) initHTTPSListeners(ctx context.Context) (err error) {
-	p.httpsServer = &http.Server{
-		Handler:           p,
-		ReadHeaderTimeout: defaultTimeout,
-		WriteTimeout:      defaultTimeout,
+	httpConf := p.HTTPConfig
+	if httpConf == nil {
+		p.logger.DebugContext(ctx, "no https configuration provided")
+
+		return nil
 	}
 
-	if p.HTTP3 {
+	mux := http.NewServeMux()
+	p.routeDoH(mux)
+
+	p.httpsServer = &http.Server{
+		Handler:           mux,
+		ReadTimeout:       httpConf.ReadTimeout,
+		ReadHeaderTimeout: httpConf.ReadTimeout,
+		WriteTimeout:      httpConf.WriteTimeout,
+	}
+
+	if httpConf.HTTP3Enabled {
 		p.h3Server = &http3.Server{
-			Handler: p,
+			Handler: mux,
 		}
 	}
 
-	for _, addr := range p.HTTPSListenAddr {
+	for _, addr := range httpConf.ListenAddresses {
 		p.logger.InfoContext(ctx, "creating an https server")
 
-		ln, tcpAddr, lErr := p.listenHTTP(ctx, addr)
+		ln, tcpAddr, lErr := p.listenHTTP(ctx, net.TCPAddrFromAddrPort(addr))
 		if lErr != nil {
-			return fmt.Errorf("failed to start HTTPS server on %s: %w", addr, lErr)
+			return fmt.Errorf("failed to start https server on %s: %w", addr, lErr)
 		}
 
 		p.httpsListen = append(p.httpsListen, ln)
 
-		if p.HTTP3 {
+		if httpConf.HTTP3Enabled {
 			// HTTP/3 server listens to the same pair IP:port as the one HTTP/2
 			// server listens to.
 			udpAddr := &net.UDPAddr{IP: tcpAddr.IP, Port: tcpAddr.Port}
@@ -107,7 +118,7 @@ func (p *Proxy) initHTTPSListeners(ctx context.Context) (err error) {
 			var quicListen *quic.EarlyListener
 			quicListen, err = p.listenH3(ctx, udpAddr)
 			if err != nil {
-				return fmt.Errorf("failed to start HTTP/3 server on %s: %w", udpAddr, err)
+				return fmt.Errorf("failed to start h3 server on %s: %w", udpAddr, err)
 			}
 
 			p.h3Listen = append(p.h3Listen, quicListen)
@@ -120,7 +131,11 @@ func (p *Proxy) initHTTPSListeners(ctx context.Context) (err error) {
 // newDoHReq returns new DNS request parsed from the given HTTP request.  In
 // case of invalid request returns nil and the suitable status code for an HTTP
 // error response.  l must not be nil.
-func newDoHReq(r *http.Request, l *slog.Logger) (req *dns.Msg, statusCode int) {
+func newDoHReq(
+	ctx context.Context,
+	r *http.Request,
+	l *slog.Logger,
+) (req *dns.Msg, statusCode int) {
 	var buf []byte
 	var err error
 
@@ -129,7 +144,8 @@ func newDoHReq(r *http.Request, l *slog.Logger) (req *dns.Msg, statusCode int) {
 		dnsParam := r.URL.Query().Get("dns")
 		buf, err = base64.RawURLEncoding.DecodeString(dnsParam)
 		if len(buf) == 0 || err != nil {
-			l.Debug(
+			l.DebugContext(
+				ctx,
 				"parsing dns request from http get param",
 				"param_name", dnsParam,
 				slogutil.KeyError, err,
@@ -140,7 +156,7 @@ func newDoHReq(r *http.Request, l *slog.Logger) (req *dns.Msg, statusCode int) {
 	case http.MethodPost:
 		contentType := r.Header.Get(httphdr.ContentType)
 		if contentType != "application/dns-message" {
-			l.Debug("unsupported media type", "content_type", contentType)
+			l.DebugContext(ctx, "unsupported media type", "content_type", contentType)
 
 			return nil, http.StatusUnsupportedMediaType
 		}
@@ -148,21 +164,21 @@ func newDoHReq(r *http.Request, l *slog.Logger) (req *dns.Msg, statusCode int) {
 		// TODO(d.kolyshev): Limit reader.
 		buf, err = io.ReadAll(r.Body)
 		if err != nil {
-			l.Debug("reading http request body", slogutil.KeyError, err)
+			l.DebugContext(ctx, "reading http request body", slogutil.KeyError, err)
 
 			return nil, http.StatusBadRequest
 		}
 
-		defer slogutil.CloseAndLog(context.TODO(), l, r.Body, slog.LevelDebug)
+		defer slogutil.CloseAndLog(ctx, l, r.Body, slog.LevelDebug)
 	default:
-		l.Debug("bad http method", "method", r.Method)
+		l.DebugContext(ctx, "bad http method", "method", r.Method)
 
 		return nil, http.StatusMethodNotAllowed
 	}
 
 	req = &dns.Msg{}
 	if err = req.Unpack(buf); err != nil {
-		l.Debug("unpacking http msg", slogutil.KeyError, err)
+		l.DebugContext(ctx, "unpacking http msg", slogutil.KeyError, err)
 
 		return nil, http.StatusBadRequest
 	}
@@ -174,12 +190,25 @@ func newDoHReq(r *http.Request, l *slog.Logger) (req *dns.Msg, statusCode int) {
 //
 // Here is what it returns:
 //
+//   - http.StatusNotFound if the request is not encrypted and proxy is not
+//     configured to accept unencrypted requests,
 //   - http.StatusBadRequest if there is no DNS request data,
 //   - http.StatusUnsupportedMediaType if request content type is not
 //     "application/dns-message",
 //   - http.StatusMethodNotAllowed if request method is not GET or POST.
 func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	p.logger.Debug("incoming https request", "url", r.URL)
+	ctx := r.Context()
+	ctx, cancel := p.reqCtx.New(ctx)
+	defer cancel()
+
+	p.logger.DebugContext(ctx, "incoming https request", "url", r.URL)
+
+	if !p.HTTPConfig.InsecureEnabled && r.TLS == nil {
+		statusCode := http.StatusNotFound
+		http.Error(w, http.StatusText(statusCode), statusCode)
+
+		return
+	}
 
 	if r.URL.Path == healthCheckPath {
 		w.Header().Set(httphdr.ContentType, "text/plain; charset=utf-8")
@@ -191,14 +220,14 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	raddr, prx, err := remoteAddr(r, p.logger)
 	if err != nil {
-		p.logger.Debug("getting real ip", slogutil.KeyError, err)
+		p.logger.DebugContext(ctx, "getting real ip", slogutil.KeyError, err)
 	}
 
 	if !p.checkBasicAuth(w, r, raddr) {
 		return
 	}
 
-	req, statusCode := newDoHReq(r, p.logger)
+	req, statusCode := newDoHReq(ctx, r, p.logger)
 	if req == nil {
 		http.Error(w, http.StatusText(statusCode), statusCode)
 
@@ -206,10 +235,12 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if prx.IsValid() {
-		p.logger.Debug("request came from proxy server", "addr", prx)
+		l := p.logger.With("addr", prx)
+
+		l.DebugContext(ctx, "request came from proxy server")
 
 		if !p.TrustedProxies.Contains(prx.Addr()) {
-			p.logger.Debug("proxy is not trusted, using original remote addr", "addr", prx)
+			l.DebugContext(ctx, "proxy is not trusted, using original remote addr")
 
 			// So the address of the proxy itself is used, as the remote address
 			// parsed from headers cannot be trusted.
@@ -223,21 +254,21 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	d.HTTPRequest = r
 	d.HTTPResponseWriter = w
 
-	err = p.handleDNSRequest(d)
+	err = p.handleDNSRequest(ctx, d)
 	if err != nil {
-		p.logger.Debug("handling dns request", "proto", d.Proto, slogutil.KeyError, err)
+		p.logger.DebugContext(ctx, "handling dns request", "proto", d.Proto, slogutil.KeyError, err)
 	}
 }
 
 // checkBasicAuth checks the basic authorization data, if necessary, and if the
 // data isn't valid, it writes an error.  shouldHandle is false if the request
-// has been denied.
+// has been denied.  p.HTTPConfig must not be nil.
 func (p *Proxy) checkBasicAuth(
 	w http.ResponseWriter,
 	r *http.Request,
 	raddr netip.AddrPort,
 ) (shouldHandle bool) {
-	ui := p.Config.Userinfo
+	ui := p.HTTPConfig.Userinfo
 	if ui == nil {
 		return true
 	}
@@ -283,8 +314,8 @@ func (p *Proxy) respondHTTPS(d *DNSContext) (err error) {
 		return fmt.Errorf("packing message: %w", err)
 	}
 
-	if srvName := p.Config.HTTPSServerName; srvName != "" {
-		w.Header().Set(httphdr.Server, srvName)
+	if srvHeader := p.HTTPConfig.ServerHeader; srvHeader != "" {
+		w.Header().Set(httphdr.Server, srvHeader)
 	}
 
 	w.Header().Set(httphdr.ContentType, "application/dns-message")
