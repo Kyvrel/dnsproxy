@@ -22,6 +22,8 @@ import (
 	"golang.org/x/net/http2"
 )
 
+const healthCheckPath = "/healthz"
+
 // listenHTTP creates instances of TLS listeners that will be used to run an
 // H1/H2 server.  Returns the address the listener actually listens to (useful
 // in the case if port 0 is specified).
@@ -178,6 +180,14 @@ func newDoHReq(r *http.Request, l *slog.Logger) (req *dns.Msg, statusCode int) {
 //   - http.StatusMethodNotAllowed if request method is not GET or POST.
 func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	p.logger.Debug("incoming https request", "url", r.URL)
+
+	if r.URL.Path == healthCheckPath {
+		w.Header().Set(httphdr.ContentType, "text/plain; charset=utf-8")
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, "OK")
+
+		return
+	}
 
 	raddr, prx, err := remoteAddr(r, p.logger)
 	if err != nil {
